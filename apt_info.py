@@ -3,14 +3,28 @@
 # Description: Expose metrics from apt. This is inspired by and
 # intended to be a replacement for the original apt.sh.
 #
-# Dependencies: python3-apt
+# This script deliberately does *not* update the apt cache. You need
+# something else to run `apt update` regularly for the metrics to be
+# up to date. This can be done in numerous ways, but the canonical way
+# is to use the normal `APT::Periodic::Update-Package-Lists`
+# setting.
 #
-# Author: Kyle Fazzari <kyrofa@ubuntu.com>
+# This, for example, will enable a nightly job that runs `apt update`:
+#
+#     echo 'APT::Periodic::Update-Package-Lists "1";' > /etc/apt/apt.conf.d/99_auto_apt_update.conf
+#
+# See /usr/lib/apt/apt.systemd.daily for details.
+#
+# Dependencies: python3-apt, python3-prometheus-client
+#
+# Authors: Kyle Fazzari <kyrofa@ubuntu.com>
+#          Daniel Swarbrick <dswarbrick@debian.org>
 
 import apt
+import apt_pkg
 import collections
-import contextlib
 import os
+from prometheus_client import CollectorRegistry, Gauge, generate_latest
 
 _UpgradeInfo = collections.namedtuple("_UpgradeInfo", ["labels", "count"])
 
@@ -37,21 +51,7 @@ def _convert_candidates_to_upgrade_infos(candidates):
     return changes_list
 
 
-def _write_upgrade_info(key, candidates):
-    upgrade_list = _convert_candidates_to_upgrade_infos(candidates)
-
-    if upgrade_list:
-        for change in upgrade_list:
-            labels = [f'{key}="{value}"' for key, value in change.labels.items()]
-            print(f'{key}{{{",".join(labels)}}} {change.count}')
-    else:
-        print(f'{key}{{origin="",arch=""}} 0')
-
-
-def _write_pending_upgrades(cache):
-    print("# HELP apt_upgrades_pending Apt packages pending updates by origin.")
-    print("# TYPE apt_upgrades_pending gauge")
-
+def _write_pending_upgrades(registry, cache):
     # Discount any changes that apply to packages that aren't installed (e.g.
     # count an upgrade to package A that adds a new dependency on package B as
     # only one upgrade, not two). See the following issue for more details:
@@ -59,49 +59,65 @@ def _write_pending_upgrades(cache):
     candidates = {
         p.candidate for p in cache.get_changes() if p.is_installed and p.marked_upgrade
     }
-    _write_upgrade_info("apt_upgrades_pending", candidates)
+    upgrade_list = _convert_candidates_to_upgrade_infos(candidates)
+
+    if upgrade_list:
+        g = Gauge('apt_upgrades_pending', "Apt packages pending updates by origin",
+                  ['origin', 'arch'], registry=registry)
+        for change in upgrade_list:
+            g.labels(change.labels['origin'], change.labels['arch']).set(change.count)
 
 
-def _write_held_upgrades(cache):
-    print("# HELP apt_upgrades_held Apt packages pending updates but held back.")
-    print("# TYPE apt_upgrades_held gauge")
-
+def _write_held_upgrades(registry, cache):
     held_candidates = {p.candidate for p in cache if p.is_upgradable and p.marked_keep}
-    _write_upgrade_info("apt_upgrades_held", held_candidates)
+    upgrade_list = _convert_candidates_to_upgrade_infos(held_candidates)
+
+    if upgrade_list:
+        g = Gauge('apt_upgrades_held', "Apt packages pending updates but held back.",
+                  ['origin', 'arch'], registry=registry)
+        for change in upgrade_list:
+            g.labels(change.labels['origin'], change.labels['arch']).set(change.count)
 
 
-def _write_autoremove_pending(cache):
+def _write_autoremove_pending(registry, cache):
     autoremovable_packages = {p for p in cache if p.is_auto_removable}
+    g = Gauge('apt_autoremove_pending', "Apt packages pending autoremoval.",
+              registry=registry)
+    g.set(len(autoremovable_packages))
 
-    print("# HELP apt_autoremove_pending Apt packages pending autoremoval.")
-    print("# TYPE apt_autoremove_pending gauge")
-    print(f"apt_autoremove_pending {len(autoremovable_packages)}")
 
-
-def _write_reboot_required():
-    print("# HELP node_reboot_required Node reboot is required for software updates.")
-    print("# TYPE node_reboot_required gauge")
-    if os.path.isfile(os.path.join(os.path.sep, "run", "reboot-required")):
-        print("node_reboot_required 1")
+def _write_cache_timestamps(registry):
+    g = Gauge('apt_package_cache_timestamp_seconds', "Apt update last run time.", registry=registry)
+    apt_pkg.init_config()
+    if apt_pkg.config.find_b("APT::Periodic::Update-Package-Lists"):
+        # if we run updates automatically with APT::Periodic, we can
+        # check this timestamp file
+        stamp_file = "/var/lib/apt/periodic/update-success-stamp"
     else:
-        print("node_reboot_required 0")
+        # if not, let's just fallback on the lists directory
+        stamp_file = '/var/lib/apt/lists'
+    try:
+        g.set(os.stat(stamp_file).st_mtime)
+    except OSError:
+        pass
+
+
+def _write_reboot_required(registry):
+    g = Gauge('node_reboot_required', "Node reboot is required for software updates.",
+              registry=registry)
+    g.set(int(os.path.isfile('/run/reboot-required')))
 
 
 def _main():
     cache = apt.cache.Cache()
 
-    # First of all, attempt to update the index. If we don't have permission
-    # to do so (or it fails for some reason), it's not the end of the world,
-    # we'll operate on the old index.
-    with contextlib.suppress(apt.cache.LockFailedException, apt.cache.FetchFailedException):
-        cache.update()
-
-    cache.open()
-    cache.upgrade(True)
-    _write_pending_upgrades(cache)
-    _write_held_upgrades(cache)
-    _write_autoremove_pending(cache)
-    _write_reboot_required()
+    registry = CollectorRegistry()
+    _write_pending_upgrades(registry, cache)
+    _write_held_upgrades(registry, cache)
+    _write_autoremove_pending(registry, cache)
+    _write_cache_timestamps(registry)
+    _write_reboot_required(registry)
+    print(generate_latest(registry).decode(), end='')
 
 
 if __name__ == "__main__":
